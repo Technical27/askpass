@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     });
 
     unit_tests.linkLibC();
-    unit_tests.linkSystemLibrary("libsecret-1");
+    unit_tests.linkSystemLibrary("glib-2.0");
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

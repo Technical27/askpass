@@ -1,8 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const c = @cImport({
+    // not used in tests
+    if (!builtin.is_test) {
+        @cInclude("libsecret/secret.h");
+    }
+
     @cInclude("glib.h");
-    @cInclude("libsecret/secret.h");
 });
 
 const Host = struct {
@@ -12,7 +17,7 @@ const Host = struct {
     alloc: std.mem.Allocator,
 
     pub fn parse(str: [:0]const u8, allocator: std.mem.Allocator) !Host {
-        const matches = c.g_regex_split_simple("(\\w+)@([\\w.:]+)", str, c.G_REGEX_DEFAULT, c.G_REGEX_MATCH_DEFAULT);
+        const matches = c.g_regex_split_simple("(\\w+)@([0-9a-zA-Z.:]+)", str, c.G_REGEX_DEFAULT, c.G_REGEX_MATCH_DEFAULT);
         defer c.g_strfreev(matches);
 
         if (matches[1] == 0) {
@@ -45,7 +50,7 @@ const Host = struct {
 };
 
 fn create_attributes(ssh_host: Host) *c.GHashTable {
-    const attributes: *c.GHashTable = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, null, c.g_free) orelse unreachable;
+    const attributes = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, null, c.g_free) orelse unreachable;
 
     _ = c.g_hash_table_insert(attributes, @constCast("username"), c.g_strdup(@ptrCast(ssh_host.username)));
     _ = c.g_hash_table_insert(attributes, @constCast("hostname"), c.g_strdup(@ptrCast(ssh_host.hostname)));
@@ -63,20 +68,14 @@ fn build_schema() c.SecretSchema {
         .name = "hostname",
         .type = c.SECRET_SCHEMA_ATTRIBUTE_STRING,
     };
+    schema_attributes[2] = std.mem.zeroes(c.SecretSchemaAttribute);
 
-    return c.SecretSchema{
-        .name = "io.github.technical27.askpass",
-        .flags = c.SECRET_SCHEMA_NONE,
-        .attributes = schema_attributes,
-        .reserved = 0,
-        .reserved1 = null,
-        .reserved2 = null,
-        .reserved3 = null,
-        .reserved4 = null,
-        .reserved5 = null,
-        .reserved6 = null,
-        .reserved7 = null,
-    };
+    var schema = std.mem.zeroes(c.SecretSchema);
+    schema.name = "io.github.technical27.askpass";
+    schema.flags = c.SECRET_SCHEMA_NONE;
+    schema.attributes = schema_attributes;
+
+    return schema;
 }
 
 fn store_password(ssh_host: Host, allocator: std.mem.Allocator) !void {
@@ -102,7 +101,7 @@ fn store_password(ssh_host: Host, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn prompt_password(allocator: std.mem.Allocator) ![:0]u8 {
+fn input_password(allocator: std.mem.Allocator) ![:0]u8 {
     const stdin_raw = std.io.getStdIn();
     const stdin_handle = stdin_raw.handle;
     const stdin = stdin_raw.reader();
@@ -110,7 +109,7 @@ fn prompt_password(allocator: std.mem.Allocator) ![:0]u8 {
     var tinfo = try std.os.tcgetattr(stdin_handle);
     const old_tinfo = tinfo;
     tinfo.lflag &= ~(std.os.linux.ECHO | std.os.linux.ECHONL);
-    const tcflags: std.os.linux.TCSA = @enumFromInt(@intFromEnum(std.os.linux.TCSA.NOW) | @intFromEnum(std.os.linux.TCSA.FLUSH));
+    const tcflags = std.os.linux.TCSA.FLUSH;
     try std.os.tcsetattr(stdin_handle, tcflags, tinfo);
 
     var password_buf = std.ArrayList(u8).init(allocator);
@@ -119,17 +118,34 @@ fn prompt_password(allocator: std.mem.Allocator) ![:0]u8 {
     try stdin.streamUntilDelimiter(password_buf.writer(), '\n', null);
 
     try std.os.tcsetattr(stdin_handle, tcflags, old_tinfo);
-    _ = try std.io.getStdErr().write("\n");
 
     return try password_buf.toOwnedSliceSentinel(0);
 }
 
-fn prompt_host_password(ssh_host: Host, allocator: std.mem.Allocator) ![:0]u8 {
+fn prompt_password(prompt: []const u8, allocator: std.mem.Allocator) ![:0]u8 {
     const stderr = std.io.getStdErr().writer();
 
-    try std.fmt.format(stderr, "please enter password for {s}@{s}: ", .{ ssh_host.username, ssh_host.hostname });
+    _ = try stderr.write(prompt);
 
-    return try prompt_password(allocator);
+    const password = try input_password(allocator);
+
+    _ = try stderr.write("\n");
+
+    return password;
+}
+
+fn prompt_host_password(ssh_host: Host, allocator: std.mem.Allocator) ![:0]u8 {
+    var prompt_buf = std.ArrayList(u8).init(allocator);
+    defer prompt_buf.deinit();
+
+    try std.fmt.format(prompt_buf.writer(), "askpass: enter password for {s}@{s}: ", .{ ssh_host.username, ssh_host.hostname });
+
+    const prompt = try prompt_buf.toOwnedSlice();
+    defer allocator.free(prompt);
+
+    const password = try prompt_password(prompt, allocator);
+
+    return password;
 }
 
 fn try_secret_service(ssh_host: Host, allocator: std.mem.Allocator) ![:0]const u8 {
@@ -139,36 +155,31 @@ fn try_secret_service(ssh_host: Host, allocator: std.mem.Allocator) ![:0]const u
     const attributes = create_attributes(ssh_host);
     defer c.g_hash_table_unref(attributes);
 
-    const items = c.secret_service_search_sync(null, &schema, attributes, c.SECRET_SEARCH_LOAD_SECRETS | c.SECRET_SEARCH_UNLOCK, null, @ptrCast(err));
+    const secret_val = c.secret_service_lookup_sync(null, &schema, attributes, null, @ptrCast(err));
 
     if (err) |e| {
         std.log.err("lookup failed: {s}", .{e.*.message});
         return error.Glib;
     }
 
-    if (items == null) return error.NoItems;
+    if (secret_val == null) return error.NoItems;
 
-    if (items.*.data) |data| {
-        const secret_val = c.secret_item_get_secret(@alignCast(@ptrCast(data)));
-        defer c.secret_value_unref(secret_val);
+    defer c.secret_value_unref(secret_val);
 
-        var len: usize = 0;
-        const secret_raw = c.secret_value_get(secret_val, &len);
-        var secret = try allocator.allocSentinel(u8, len, 0);
-        @memcpy(secret, @as([*]const u8, secret_raw));
+    var len: usize = 0;
+    const secret_raw = c.secret_value_get(secret_val, &len);
+    var secret = try allocator.allocSentinel(u8, len, 0);
+    @memcpy(secret, @as([*]const u8, secret_raw));
 
-        return secret;
-    }
-
-    return error.NoItems;
+    return secret;
 }
 
 pub fn main() !void {
-    c.g_set_application_name("askpass");
-
     if (std.os.argv.len < 2) {
         return;
     }
+
+    c.g_set_application_name("askpass");
 
     var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_instance.deinit();
@@ -176,14 +187,18 @@ pub fn main() !void {
     const gpa = gpa_instance.allocator();
     const stdout = std.io.getStdOut().writer();
 
-    const prompt = std.mem.span(std.os.argv[1]);
-    var ssh_host = Host.parse(prompt, gpa) catch |e| {
+    const ssh_prompt = std.mem.span(std.os.argv[1]);
+    var ssh_host = Host.parse(ssh_prompt, gpa) catch |e| {
         if (e == error.NoMatch) {
-            const stderr = std.io.getStdErr().writer();
-            _ = try stderr.write("askpass: Failed to parse prompt, asking below\n");
-            _ = try stderr.write(prompt);
+            var prompt_buf = std.ArrayList(u8).init(gpa);
+            defer prompt_buf.deinit();
 
-            const pass = try prompt_password(gpa);
+            try std.fmt.format(prompt_buf.writer(), "askpass: Failed to parse prompt, asking below\n{s}", .{ssh_prompt});
+
+            const prompt = try prompt_buf.toOwnedSlice();
+            defer gpa.free(prompt);
+
+            const pass = try prompt_password(prompt, gpa);
             defer gpa.free(pass);
 
             _ = try stdout.write(pass);
@@ -226,7 +241,54 @@ test "parse_host_gentoo" {
     try std.testing.expectEqualStrings("127.0.0.1", host.hostname);
 }
 
+test "parse_host_ipv6" {
+    const s = "(test@1234:abcd:efab:ABD::1) Password: ";
+    const host = try Host.parse(s, std.testing.allocator);
+    defer host.deinit();
+
+    try std.testing.expectEqualStrings("test", host.username);
+    try std.testing.expectEqualStrings("1234:abcd:efab:ABD::1", host.hostname);
+}
+
+test "parse_host_ipv4" {
+    const s = "(test@172.253.124.102) Password: ";
+    const host = try Host.parse(s, std.testing.allocator);
+    defer host.deinit();
+
+    try std.testing.expectEqualStrings("test", host.username);
+    try std.testing.expectEqualStrings("172.253.124.102", host.hostname);
+}
+
+test "parse_host_domain" {
+    const s = "(test@test.example.com) Password: ";
+    const host = try Host.parse(s, std.testing.allocator);
+    defer host.deinit();
+
+    try std.testing.expectEqualStrings("test", host.username);
+    try std.testing.expectEqualStrings("test.example.com", host.hostname);
+}
+
+test "parse_host_username" {
+    const s = "(Test_name@127.0.0.1) Password: ";
+    const host = try Host.parse(s, std.testing.allocator);
+    defer host.deinit();
+
+    try std.testing.expectEqualStrings("Test_name", host.username);
+    try std.testing.expectEqualStrings("127.0.0.1", host.hostname);
+}
+
 test "parse_host_fail" {
     const s = "(test 127.0.0.1)";
     try std.testing.expectError(error.NoMatch, Host.parse(s, std.testing.allocator));
+}
+
+test "attributes_check" {
+    const h = try Host.parse("a@1", std.testing.allocator);
+    defer h.deinit();
+
+    const attributes = create_attributes(h);
+    defer c.g_hash_table_unref(attributes);
+
+    try std.testing.expect(c.g_hash_table_contains(attributes, @constCast("username")) != 0);
+    try std.testing.expect(c.g_hash_table_contains(attributes, @constCast("hostname")) != 0);
 }
