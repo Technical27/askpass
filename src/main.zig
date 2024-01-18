@@ -134,11 +134,11 @@ fn prompt_password(prompt: []const u8, allocator: std.mem.Allocator) ![:0]u8 {
     return password;
 }
 
-fn prompt_host_password(ssh_host: Host, allocator: std.mem.Allocator) ![:0]u8 {
+fn prompt_host_password(info: []const u8, ssh_host: Host, allocator: std.mem.Allocator) ![:0]u8 {
     var prompt_buf = std.ArrayList(u8).init(allocator);
     defer prompt_buf.deinit();
 
-    try std.fmt.format(prompt_buf.writer(), "askpass: enter password for {s}@{s}: ", .{ ssh_host.username, ssh_host.hostname });
+    try std.fmt.format(prompt_buf.writer(), "askpass: {s}\nplease enter password for: {s}@{s}: ", .{ info, ssh_host.username, ssh_host.hostname });
 
     const prompt = try prompt_buf.toOwnedSlice();
     defer allocator.free(prompt);
@@ -146,6 +146,63 @@ fn prompt_host_password(ssh_host: Host, allocator: std.mem.Allocator) ![:0]u8 {
     const password = try prompt_password(prompt, allocator);
 
     return password;
+}
+
+fn prompt_fallback_password(info: []const u8, ssh_prompt: [:0]const u8, allocator: std.mem.Allocator) ![:0]u8 {
+    var prompt_buf = std.ArrayList(u8).init(allocator);
+    defer prompt_buf.deinit();
+
+    try std.fmt.format(prompt_buf.writer(), "askpass: {s}\n{s}", .{ info, ssh_prompt });
+
+    const prompt = try prompt_buf.toOwnedSlice();
+    defer allocator.free(prompt);
+
+    return prompt_password(prompt, allocator);
+}
+
+fn getppid() std.os.linux.pid_t {
+    return c.getppid();
+}
+
+const check_path = "/tmp/askpass-pid";
+
+// Checks the stored previous parent process id to check
+// if this program has already been called for a password.
+// NOTE: this is the best way to work around a dumb design.
+// Uses the parent process id to check if the password is wrong.
+// SSH_ASKPASS doesn't give the program any indication if the password was wrong,
+// It just calls the same program again to ask for the password.
+// When filling in a password automatically, it is possible for the incorrect to repeatedly be input.
+// And possibly lock/ban an account or ip
+fn check_previous_fail() !bool {
+    const flags = std.fs.File.OpenFlags{};
+    if (std.fs.openFileAbsolute(check_path, flags)) |file| {
+        defer file.close();
+
+        var buf: [10]u8 = undefined;
+        const num_size = try file.reader().readAll(&buf);
+
+        const old_ppid = try std.fmt.parseInt(u32, buf[0..num_size], 10);
+        const ppid = getppid();
+
+        return old_ppid == ppid;
+    } else |_| {
+        return false;
+    }
+}
+
+// Write current parent process id to check later.
+// NOTE: see check_previous_fail for mor information.
+fn write_current_ppid() void {
+    // clear out old ppid on open
+    const flags = std.fs.File.CreateFlags{
+        .truncate = true,
+    };
+    const file = std.fs.createFileAbsolute(check_path, flags) catch return;
+    defer file.close();
+
+    const ppid = getppid();
+    std.fmt.format(file.writer(), "{}", .{ppid}) catch return;
 }
 
 fn try_secret_service(ssh_host: Host, allocator: std.mem.Allocator) ![:0]const u8 {
@@ -185,42 +242,51 @@ pub fn main() !void {
     defer _ = gpa_instance.deinit();
 
     const gpa = gpa_instance.allocator();
+
     const stdout = std.io.getStdOut().writer();
 
     const ssh_prompt = std.mem.span(std.os.argv[1]);
+
     var ssh_host = Host.parse(ssh_prompt, gpa) catch |e| {
         if (e == error.NoMatch) {
-            var prompt_buf = std.ArrayList(u8).init(gpa);
-            defer prompt_buf.deinit();
+            const password = try prompt_fallback_password("Failed to parse prompt, asking below", ssh_prompt, gpa);
+            defer gpa.free(password);
 
-            try std.fmt.format(prompt_buf.writer(), "askpass: Failed to parse prompt, asking below\n{s}", .{ssh_prompt});
-
-            const prompt = try prompt_buf.toOwnedSlice();
-            defer gpa.free(prompt);
-
-            const pass = try prompt_password(prompt, gpa);
-            defer gpa.free(pass);
-
-            _ = try stdout.write(pass);
+            _ = try stdout.write(password);
 
             return;
         }
 
         return e;
     };
+
     defer ssh_host.deinit();
 
-    if (try_secret_service(ssh_host, gpa)) |pass| {
-        defer gpa.free(pass);
-        _ = try stdout.write(pass);
-    } else |_| {
-        const password = try prompt_host_password(ssh_host, gpa);
+    const previous_attempt = try check_previous_fail();
 
-        _ = try stdout.write(password);
+    if (!previous_attempt) {
+        if (try_secret_service(ssh_host, gpa)) |password| {
+            defer gpa.free(password);
 
-        ssh_host.password = password;
-        try store_password(ssh_host, gpa);
+            write_current_ppid();
+
+            _ = try stdout.write(password);
+
+            return;
+        } else |_| {}
     }
+
+    const prompt = if (previous_attempt) "previous password was wrong, asking below" else "no password for this server";
+    const password = try prompt_host_password(prompt, ssh_host, gpa);
+
+    if (!previous_attempt) {
+        write_current_ppid();
+    }
+
+    _ = try stdout.write(password);
+
+    ssh_host.password = password;
+    try store_password(ssh_host, gpa);
 }
 
 test "parse_host_ubuntu" {
