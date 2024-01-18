@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
 const c = @cImport({
     // not used in tests
     if (!builtin.is_test) {
@@ -14,9 +17,9 @@ const Host = struct {
     hostname: [:0]const u8,
     username: [:0]const u8,
     password: ?[:0]const u8,
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
 
-    pub fn parse(str: [:0]const u8, allocator: std.mem.Allocator) !Host {
+    pub fn parse(str: [:0]const u8, allocator: Allocator) !Host {
         const matches = c.g_regex_split_simple("(\\w+)@([0-9a-zA-Z.:]+)", str, c.G_REGEX_DEFAULT, c.G_REGEX_MATCH_DEFAULT);
         defer c.g_strfreev(matches);
 
@@ -78,14 +81,14 @@ fn build_schema() c.SecretSchema {
     return schema;
 }
 
-fn store_password(ssh_host: Host, allocator: std.mem.Allocator) !void {
+fn store_password(ssh_host: Host, allocator: Allocator) !void {
     const schema = build_schema();
     var err: ?*c.GError = null;
 
     const attributes = create_attributes(ssh_host);
     defer c.g_hash_table_unref(attributes);
 
-    var label_buf = std.ArrayList(u8).init(allocator);
+    var label_buf = ArrayList(u8).init(allocator);
     defer label_buf.deinit();
 
     try std.fmt.format(label_buf.writer(), "SSH {s}@{s}", .{ ssh_host.username, ssh_host.hostname });
@@ -101,7 +104,7 @@ fn store_password(ssh_host: Host, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn input_password(allocator: std.mem.Allocator) ![:0]u8 {
+fn input_password(allocator: Allocator) ![:0]u8 {
     const stdin_raw = std.io.getStdIn();
     const stdin_handle = stdin_raw.handle;
     const stdin = stdin_raw.reader();
@@ -112,7 +115,7 @@ fn input_password(allocator: std.mem.Allocator) ![:0]u8 {
     const tcflags = std.os.linux.TCSA.FLUSH;
     try std.os.tcsetattr(stdin_handle, tcflags, tinfo);
 
-    var password_buf = std.ArrayList(u8).init(allocator);
+    var password_buf = ArrayList(u8).init(allocator);
     defer password_buf.deinit();
 
     try stdin.streamUntilDelimiter(password_buf.writer(), '\n', null);
@@ -122,7 +125,7 @@ fn input_password(allocator: std.mem.Allocator) ![:0]u8 {
     return try password_buf.toOwnedSliceSentinel(0);
 }
 
-fn prompt_password(prompt: []const u8, allocator: std.mem.Allocator) ![:0]u8 {
+fn prompt_password(prompt: []const u8, allocator: Allocator) ![:0]u8 {
     const stderr = std.io.getStdErr().writer();
 
     _ = try stderr.write(prompt);
@@ -134,8 +137,8 @@ fn prompt_password(prompt: []const u8, allocator: std.mem.Allocator) ![:0]u8 {
     return password;
 }
 
-fn prompt_host_password(info: []const u8, ssh_host: Host, allocator: std.mem.Allocator) ![:0]u8 {
-    var prompt_buf = std.ArrayList(u8).init(allocator);
+fn prompt_host_password(info: []const u8, ssh_host: Host, allocator: Allocator) ![:0]u8 {
+    var prompt_buf = ArrayList(u8).init(allocator);
     defer prompt_buf.deinit();
 
     try std.fmt.format(prompt_buf.writer(), "askpass: {s}\nplease enter password for: {s}@{s}: ", .{ info, ssh_host.username, ssh_host.hostname });
@@ -148,8 +151,8 @@ fn prompt_host_password(info: []const u8, ssh_host: Host, allocator: std.mem.All
     return password;
 }
 
-fn prompt_fallback_password(info: []const u8, ssh_prompt: [:0]const u8, allocator: std.mem.Allocator) ![:0]u8 {
-    var prompt_buf = std.ArrayList(u8).init(allocator);
+fn prompt_fallback_password(info: []const u8, ssh_prompt: [:0]const u8, allocator: Allocator) ![:0]u8 {
+    var prompt_buf = ArrayList(u8).init(allocator);
     defer prompt_buf.deinit();
 
     try std.fmt.format(prompt_buf.writer(), "askpass: {s}\n{s}", .{ info, ssh_prompt });
@@ -164,7 +167,7 @@ fn getppid() std.os.linux.pid_t {
     return c.getppid();
 }
 
-const check_path = "/tmp/askpass-pid";
+const check_path: [:0]const u8 = "/tmp/askpass-pid";
 
 // Checks the stored previous parent process id to check
 // if this program has already been called for a password.
@@ -175,20 +178,16 @@ const check_path = "/tmp/askpass-pid";
 // When filling in a password automatically, it is possible for the incorrect to repeatedly be input.
 // And possibly lock/ban an account or ip
 fn check_previous_fail() !bool {
-    const flags = std.fs.File.OpenFlags{};
-    if (std.fs.openFileAbsolute(check_path, flags)) |file| {
-        defer file.close();
+    const file = std.fs.openFileAbsoluteZ(check_path, std.fs.File.OpenFlags{}) catch return false;
+    defer file.close();
 
-        var buf: [10]u8 = undefined;
-        const num_size = try file.reader().readAll(&buf);
+    var buf: [10]u8 = undefined;
+    const num_size = try file.reader().readAll(&buf);
 
-        const old_ppid = try std.fmt.parseInt(u32, buf[0..num_size], 10);
-        const ppid = getppid();
+    const old_ppid = try std.fmt.parseUnsigned(u32, buf[0..num_size], 10);
+    const ppid = getppid();
 
-        return old_ppid == ppid;
-    } else |_| {
-        return false;
-    }
+    return old_ppid == ppid;
 }
 
 // Write current parent process id to check later.
@@ -198,14 +197,14 @@ fn write_current_ppid() void {
     const flags = std.fs.File.CreateFlags{
         .truncate = true,
     };
-    const file = std.fs.createFileAbsolute(check_path, flags) catch return;
+    const file = std.fs.createFileAbsoluteZ(check_path, flags) catch return;
     defer file.close();
 
     const ppid = getppid();
     std.fmt.format(file.writer(), "{}", .{ppid}) catch return;
 }
 
-fn try_secret_service(ssh_host: Host, allocator: std.mem.Allocator) ![:0]const u8 {
+fn try_secret_service(ssh_host: Host, allocator: Allocator) ![:0]const u8 {
     var err: ?*c.GError = null;
     const schema = build_schema();
 
